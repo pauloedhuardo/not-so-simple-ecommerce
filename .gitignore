@@ -539,7 +539,7 @@ FodyWeavers.xsd
 # Additional files built by Visual Studio
 
 # Terraform
-**iac/.terraform/
+iac/.terraform/
 *.tfstate
 *.tfstate.*
 errored.tfstate
