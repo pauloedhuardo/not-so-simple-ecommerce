@@ -1,0 +1,268 @@
+name: Continuos Integration BackEnd
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+    - 'src/services/**'
+    - 'src/workers/**'
+    - 'src/domains/**'
+    - 'src/infrastructure/**'
+    - 'NotSoSimpleEcommerce.sln'
+    - '.dockerignore'
+    - '.github/workflows/continuos-integration-backend.yml'
+  push:
+    paths:
+    - 'src/services/**'
+    - 'src/workers/**'
+    - 'src/domains/**'
+    - 'src/infrastructure/**'
+    - 'NotSoSimpleEcommerce.sln'
+    - '.dockerignore'
+    - '.github/workflows/continuos-integration-backend.yml'
+
+concurrency:
+  group: ci-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  DOTNET_VERSION: 6.0.x
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+
+  build-and-test:
+    name: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-keys: ${{ runner.os }}-nuget-
+
+    - name: Restore
+      run: dotnet restore NotSoSimpleEcommerce.sln
+
+    - name: Build
+      run: dotnet build NotSoSimpleEcommerce.sln -c Release --no-restore
+
+    - name: Test
+      run: dotnet test NotSoSimpleEcommerce.sln -c Release --no-build --logger trx --results-directory ./test-results
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-${{ github.sha }}
+        path: ./test-results
+        if-no-files-found: ignore
+
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      main: ${{ steps.filter.outputs.main }}
+      order: ${{ steps.filter.outputs.order }}
+      identity_server: ${{ steps.filter.outputs.identity_server }}
+      health_checker: ${{ steps.filter.outputs.health_checker }}
+      invoice_generator: ${{ steps.filter.outputs.invoice_generator }}
+      notificator: ${{ steps.filter.outputs.notificator }}
+    steps:
+
+    - uses: actions/checkout@v4
+
+    # Each microservice is matched against its own folder plus every project it
+    # references transitively, since the images are built from the repository root.
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          main:
+            - 'src/services/NotSoSimpleEcommerce.Main/**'
+            - 'src/domains/NotSoSimpleEcommerce.Main.Domain/**'
+            - 'src/domains/NotSoSimpleEcommerce.Order.Domain/**'
+            - 'src/domains/NotSoSimpleEcommerce.Shared/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.Repositories/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.S3Handler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.SesHandler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.SqsHandler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.Utils/**'
+            - '.dockerignore'
+            - '.github/workflows/continuos-integration-backend.yml'
+          order:
+            - 'src/services/NotSoSimpleEcommerce.Order/**'
+            - 'src/domains/NotSoSimpleEcommerce.Main.Domain/**'
+            - 'src/domains/NotSoSimpleEcommerce.Order.Domain/**'
+            - 'src/domains/NotSoSimpleEcommerce.Shared/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.Repositories/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.S3Handler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.SesHandler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.SqsHandler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.Utils/**'
+            - '.dockerignore'
+            - '.github/workflows/continuos-integration-backend.yml'
+          identity_server:
+            - 'src/services/NotSoSimpleEcommerce.IdentityServer/**'
+            - 'src/domains/NotSoSimpleEcommerce.IdentityServer.Domain/**'
+            - 'src/domains/NotSoSimpleEcommerce.Shared/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.Repositories/**'
+            - '.dockerignore'
+            - '.github/workflows/continuos-integration-backend.yml'
+          health_checker:
+            - 'src/services/NotSoSimpleEcommerce.HealthChecker/**'
+            - '.dockerignore'
+            - '.github/workflows/continuos-integration-backend.yml'
+          invoice_generator:
+            - 'src/workers/NotSoSimpleEcommerce.InvoiceGenerator/**'
+            - 'src/domains/NotSoSimpleEcommerce.Shared/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.SesHandler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.SqsHandler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.Utils/**'
+            - '.dockerignore'
+            - '.github/workflows/continuos-integration-backend.yml'
+          notificator:
+            - 'src/workers/NotSoSimpleEcommerce.Notificator/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.SesHandler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.SqsHandler/**'
+            - 'src/infrastructure/NotSoSimpleEcommerce.Utils/**'
+            - '.dockerignore'
+            - '.github/workflows/continuos-integration-backend.yml'
+
+  docker-main:
+    name: docker-main
+    needs: [build-and-test, changes]
+    if: needs.changes.outputs.main == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Docker Build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./src/services/NotSoSimpleEcommerce.Main/Dockerfile
+        push: false
+        tags: nsse/main:${{ github.sha }}
+        cache-from: type=gha,scope=main
+        cache-to: type=gha,mode=max,scope=main
+
+  docker-order:
+    name: docker-order
+    needs: [build-and-test, changes]
+    if: needs.changes.outputs.order == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Docker Build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./src/services/NotSoSimpleEcommerce.Order/Dockerfile
+        push: false
+        tags: nsse/order:${{ github.sha }}
+        cache-from: type=gha,scope=order
+        cache-to: type=gha,mode=max,scope=order
+
+  docker-identity-server:
+    name: docker-identity-server
+    needs: [build-and-test, changes]
+    if: needs.changes.outputs.identity_server == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Docker Build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./src/services/NotSoSimpleEcommerce.IdentityServer/Dockerfile
+        push: false
+        tags: nsse/identity:${{ github.sha }}
+        cache-from: type=gha,scope=identity-server
+        cache-to: type=gha,mode=max,scope=identity-server
+
+  docker-health-checker:
+    name: docker-health-checker
+    needs: [build-and-test, changes]
+    if: needs.changes.outputs.health_checker == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Docker Build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./src/services/NotSoSimpleEcommerce.HealthChecker/Dockerfile
+        push: false
+        tags: nsse/health-checker:${{ github.sha }}
+        cache-from: type=gha,scope=health-checker
+        cache-to: type=gha,mode=max,scope=health-checker
+
+  docker-invoice-generator:
+    name: docker-invoice-generator
+    needs: [build-and-test, changes]
+    if: needs.changes.outputs.invoice_generator == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Docker Build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./src/workers/NotSoSimpleEcommerce.InvoiceGenerator/Dockerfile
+        push: false
+        tags: nsse/invoice-generator:${{ github.sha }}
+        cache-from: type=gha,scope=invoice-generator
+        cache-to: type=gha,mode=max,scope=invoice-generator
+
+  docker-notificator:
+    name: docker-notificator
+    needs: [build-and-test, changes]
+    if: needs.changes.outputs.notificator == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Docker Build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./src/workers/NotSoSimpleEcommerce.Notificator/Dockerfile
+        push: false
+        tags: nsse/notificator:${{ github.sha }}
+        cache-from: type=gha,scope=notificator
+        cache-to: type=gha,mode=max,scope=notificator
