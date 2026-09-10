@@ -1,0 +1,175 @@
+name: Rollback BackEnd
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Microservico para reverter'
+        required: true
+        type: choice
+        options:
+        - main
+        - order
+        - identity-server
+        - health-checker
+        - invoice-generator
+        - notificator
+      tag:
+        description: 'Tag de destino. Vazio: usa a tag anterior distinta encontrada no historico do kustomization.yml'
+        required: false
+        type: string
+
+# Compartilha o group com o CD: um rollback nao pode correr junto de um deploy,
+# senao os dois disputam o mesmo kustomization.yml.
+concurrency:
+  group: cd-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 495624154773.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_REPO_PREFIX: nsse/production
+  GITOPS_REPO: pauloedhuardo/nsse-gitops
+  GITOPS_KUSTOMIZE_DIR: production
+
+jobs:
+
+  rollback:
+    name: rollback ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v5.1.0
+      with:
+        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ vars.AWS_BACKEND_ROLE_TO_ASSUME }}
+
+    - name: Checkout gitops
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.GITOPS_REPO }}
+        token: ${{ secrets.GITOPS_TOKEN }}
+        ref: main
+        # Resolver a tag anterior exige percorrer o historico do arquivo.
+        fetch-depth: 0
+
+    - uses: imranismail/setup-kustomize@v2
+
+    - name: Resolve target tag
+      id: resolve
+      env:
+        SERVICE: ${{ inputs.service }}
+        INPUT_TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+
+        IMAGE="${ECR_REGISTRY}/${IMAGE_REPO_PREFIX}/${SERVICE}"
+        FILE="${GITOPS_KUSTOMIZE_DIR}/kustomization.yml"
+
+        # Le a newTag da entrada cujo "name" casa com a imagem. Funciona tanto no
+        # recuo original do arquivo quanto no que o kustomize edit reescreve.
+        extract_tag() {
+          awk -v img="$IMAGE" '
+            $1 == "-" && $2 == "name:" && $3 == img { found = 1; next }
+            found && $1 == "newTag:" { print $2; exit }
+            found && $1 == "-" && $2 == "name:" { found = 0 }
+          '
+        }
+
+        CURRENT=$(extract_tag < "$FILE")
+        if [ -z "$CURRENT" ]; then
+          echo "Nao encontrei a imagem ${IMAGE} em ${FILE}" >&2
+          exit 1
+        fi
+        echo "tag atual: ${CURRENT}"
+
+        if [ -n "$INPUT_TAG" ]; then
+          TARGET="$INPUT_TAG"
+          echo "tag de destino informada manualmente: ${TARGET}"
+        else
+          TARGET=""
+          # Caminha o historico do arquivo ate achar uma tag diferente da atual.
+          for sha in $(git log --format=%H -- "$FILE"); do
+            CANDIDATE=$(git show "${sha}:${FILE}" 2>/dev/null | extract_tag || true)
+            if [ -n "$CANDIDATE" ] && [ "$CANDIDATE" != "$CURRENT" ]; then
+              TARGET="$CANDIDATE"
+              echo "tag anterior encontrada em ${sha}: ${TARGET}"
+              break
+            fi
+          done
+          if [ -z "$TARGET" ]; then
+            echo "Nao ha tag anterior distinta de ${CURRENT} no historico de ${FILE}" >&2
+            echo "Informe a tag manualmente pelo input 'tag'." >&2
+            exit 1
+          fi
+        fi
+
+        if [ "$TARGET" = "$CURRENT" ]; then
+          echo "A tag de destino e igual a atual (${CURRENT}); nada a fazer." >&2
+          exit 1
+        fi
+
+        echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+        echo "target=${TARGET}"   >> "$GITHUB_OUTPUT"
+        echo "image=${IMAGE}"     >> "$GITHUB_OUTPUT"
+
+    - name: Verify target image exists in ECR
+      env:
+        SERVICE: ${{ inputs.service }}
+        TARGET: ${{ steps.resolve.outputs.target }}
+      run: |
+        set -euo pipefail
+        # Reverter para uma tag que nao existe mais deixaria os pods em
+        # ImagePullBackOff. Melhor falhar aqui.
+        aws ecr describe-images \
+          --region "${AWS_REGION}" \
+          --repository-name "${IMAGE_REPO_PREFIX}/${SERVICE}" \
+          --image-ids "imageTag=${TARGET}" \
+          > /dev/null
+        echo "imagem ${SERVICE}:${TARGET} existe no ECR"
+
+    - name: Set image back to target tag
+      working-directory: ${{ env.GITOPS_KUSTOMIZE_DIR }}
+      env:
+        SERVICE: ${{ inputs.service }}
+        TARGET: ${{ steps.resolve.outputs.target }}
+      run: |
+        set -euo pipefail
+        kustomize edit set image "${ECR_REGISTRY}/${IMAGE_REPO_PREFIX}/${SERVICE}=*:${TARGET}"
+
+    - name: Commit & push
+      env:
+        SERVICE: ${{ inputs.service }}
+        CURRENT: ${{ steps.resolve.outputs.current }}
+        TARGET: ${{ steps.resolve.outputs.target }}
+      run: |
+        set -euo pipefail
+        git config user.email "ci-bot@nsse.dev"
+        git config user.name "nsse-ci-bot"
+        git add "${GITOPS_KUSTOMIZE_DIR}/kustomization.yml"
+
+        if git diff --staged --quiet; then
+          echo "Nenhuma alteracao no kustomization.yml; nada a commitar."
+          exit 0
+        fi
+
+        git commit -m "ci(rollback): ${SERVICE} de ${CURRENT} para ${TARGET}"
+
+        for attempt in 1 2 3; do
+          if git push; then
+            echo "push ok na tentativa ${attempt}"
+            exit 0
+          fi
+          echo "push rejeitado; rebase e nova tentativa"
+          git pull --rebase
+        done
+
+        echo "Falha ao empurrar no ${GITOPS_REPO} apos 3 tentativas" >&2
+        exit 1
