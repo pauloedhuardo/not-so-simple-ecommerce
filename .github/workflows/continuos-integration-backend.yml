@@ -200,7 +200,7 @@ jobs:
         context: .
         file: ./src/services/NotSoSimpleEcommerce.IdentityServer/Dockerfile
         push: false
-        tags: nsse/identity:${{ github.sha }}
+        tags: nsse/identity-server:${{ github.sha }}
         cache-from: type=gha,scope=identity-server
         cache-to: type=gha,mode=max,scope=identity-server
 
