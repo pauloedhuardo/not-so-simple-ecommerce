@@ -34,12 +34,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.refs.outputs.tag }}
-      main: ${{ steps.filter.outputs.main }}
-      order: ${{ steps.filter.outputs.order }}
-      identity_server: ${{ steps.filter.outputs.identity_server }}
-      health_checker: ${{ steps.filter.outputs.health_checker }}
-      invoice_generator: ${{ steps.filter.outputs.invoice_generator }}
-      notificator: ${{ steps.filter.outputs.notificator }}
+      # Array JSON com uma entrada por servico alterado, consumido como matriz
+      # pelo job de build e como lista de bumps pelo update-gitops.
+      services: ${{ steps.matrix.outputs.services }}
     steps:
 
     - uses: actions/checkout@v4
@@ -51,6 +48,7 @@ jobs:
     - name: Resolve refs and tag
       id: refs
       run: |
+        set -euo pipefail
         HEAD_SHA=$(git rev-parse HEAD)
         # Primeiro commit do repositorio nao tem pai; nesse caso compara com a
         # arvore vazia, o que marca tudo como alterado.
@@ -93,16 +91,16 @@ jobs:
             - 'src/infrastructure/NotSoSimpleEcommerce.SqsHandler/**'
             - 'src/infrastructure/NotSoSimpleEcommerce.Utils/**'
             - '.dockerignore'
-          identity_server:
+          identity-server:
             - 'src/services/NotSoSimpleEcommerce.IdentityServer/**'
             - 'src/domains/NotSoSimpleEcommerce.IdentityServer.Domain/**'
             - 'src/domains/NotSoSimpleEcommerce.Shared/**'
             - 'src/infrastructure/NotSoSimpleEcommerce.Repositories/**'
             - '.dockerignore'
-          health_checker:
+          health-checker:
             - 'src/services/NotSoSimpleEcommerce.HealthChecker/**'
             - '.dockerignore'
-          invoice_generator:
+          invoice-generator:
             - 'src/workers/NotSoSimpleEcommerce.InvoiceGenerator/**'
             - 'src/domains/NotSoSimpleEcommerce.Shared/**'
             - 'src/infrastructure/NotSoSimpleEcommerce.SesHandler/**'
@@ -116,15 +114,55 @@ jobs:
             - 'src/infrastructure/NotSoSimpleEcommerce.Utils/**'
             - '.dockerignore'
 
-  main:
-    name: main
+    # Fonte unica da lista de servicos: o slug alimenta o nome do repositorio no
+    # ECR, o scope do cache e o argumento do kustomize edit, entao nao ha como
+    # divergirem entre si.
+    - name: Build matrix
+      id: matrix
+      env:
+        CHANGED: ${{ steps.filter.outputs.changes }}
+        DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+      run: |
+        set -euo pipefail
+
+        # service -> Dockerfile. workflow_dispatch reconstroi todos.
+        CATALOG=$(cat <<'JSON'
+        [
+          {"service":"main",              "dockerfile":"./src/services/NotSoSimpleEcommerce.Main/Dockerfile"},
+          {"service":"order",             "dockerfile":"./src/services/NotSoSimpleEcommerce.Order/Dockerfile"},
+          {"service":"identity-server",   "dockerfile":"./src/services/NotSoSimpleEcommerce.IdentityServer/Dockerfile"},
+          {"service":"health-checker",    "dockerfile":"./src/services/NotSoSimpleEcommerce.HealthChecker/Dockerfile"},
+          {"service":"invoice-generator", "dockerfile":"./src/workers/NotSoSimpleEcommerce.InvoiceGenerator/Dockerfile"},
+          {"service":"notificator",       "dockerfile":"./src/workers/NotSoSimpleEcommerce.Notificator/Dockerfile"}
+        ]
+        JSON
+        )
+
+        if [ "$DISPATCH" = "true" ]; then
+          SERVICES=$(jq -c '.' <<<"$CATALOG")
+        else
+          # steps.filter.outputs.changes e um array JSON com os filtros que casaram.
+          SERVICES=$(jq -c --argjson changed "$CHANGED" \
+            '[ .[] | select(.service as $s | $changed | index($s)) ]' <<<"$CATALOG")
+        fi
+
+        echo "services=$SERVICES" >> "$GITHUB_OUTPUT"
+        echo "Servicos a publicar: $(jq -r '[.[].service] | join(", ") // "nenhum"' <<<"$SERVICES")"
+
+  build-and-push:
+    name: build ${{ matrix.service }}
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.main == 'true' || github.event_name == 'workflow_dispatch'
+    if: needs.detect-changes.outputs.services != '[]'
     runs-on: ubuntu-latest
     environment: production
     permissions:
       id-token: write
       contents: read
+    strategy:
+      # Um servico que falha nao deve cancelar os demais que ja estao publicando.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect-changes.outputs.services) }}
     steps:
 
     - uses: actions/checkout@v4
@@ -145,204 +183,23 @@ jobs:
       uses: docker/build-push-action@v6
       with:
         context: .
-        file: ./src/services/NotSoSimpleEcommerce.Main/Dockerfile
+        file: ${{ matrix.dockerfile }}
         push: true
-        tags: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO_PREFIX }}/main:${{ needs.detect-changes.outputs.tag }}
-        cache-from: type=gha,scope=main
-        cache-to: type=gha,mode=max,scope=main
-
-  order:
-    name: order
-    needs: [detect-changes]
-    if: needs.detect-changes.outputs.order == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v5.1.0
-      with:
-        aws-region: ${{ env.AWS_REGION }}
-        role-to-assume: ${{ vars.AWS_BACKEND_ROLE_TO_ASSUME }}
-
-    - uses: aws-actions/amazon-ecr-login@v2
-
-    - uses: docker/setup-buildx-action@v3
-
-    - name: Build & Push
-      uses: docker/build-push-action@v6
-      with:
-        context: .
-        file: ./src/services/NotSoSimpleEcommerce.Order/Dockerfile
-        push: true
-        tags: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO_PREFIX }}/order:${{ needs.detect-changes.outputs.tag }}
-        cache-from: type=gha,scope=order
-        cache-to: type=gha,mode=max,scope=order
-
-  identity-server:
-    name: identity-server
-    needs: [detect-changes]
-    if: needs.detect-changes.outputs.identity_server == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v5.1.0
-      with:
-        aws-region: ${{ env.AWS_REGION }}
-        role-to-assume: ${{ vars.AWS_BACKEND_ROLE_TO_ASSUME }}
-
-    - uses: aws-actions/amazon-ecr-login@v2
-
-    - uses: docker/setup-buildx-action@v3
-
-    - name: Build & Push
-      uses: docker/build-push-action@v6
-      with:
-        context: .
-        file: ./src/services/NotSoSimpleEcommerce.IdentityServer/Dockerfile
-        push: true
-        tags: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO_PREFIX }}/identity-server:${{ needs.detect-changes.outputs.tag }}
-        cache-from: type=gha,scope=identity-server
-        cache-to: type=gha,mode=max,scope=identity-server
-
-  health-checker:
-    name: health-checker
-    needs: [detect-changes]
-    if: needs.detect-changes.outputs.health_checker == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v5.1.0
-      with:
-        aws-region: ${{ env.AWS_REGION }}
-        role-to-assume: ${{ vars.AWS_BACKEND_ROLE_TO_ASSUME }}
-
-    - uses: aws-actions/amazon-ecr-login@v2
-
-    - uses: docker/setup-buildx-action@v3
-
-    - name: Build & Push
-      uses: docker/build-push-action@v6
-      with:
-        context: .
-        file: ./src/services/NotSoSimpleEcommerce.HealthChecker/Dockerfile
-        push: true
-        tags: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO_PREFIX }}/health-checker:${{ needs.detect-changes.outputs.tag }}
-        cache-from: type=gha,scope=health-checker
-        cache-to: type=gha,mode=max,scope=health-checker
-
-  invoice-generator:
-    name: invoice-generator
-    needs: [detect-changes]
-    if: needs.detect-changes.outputs.invoice_generator == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v5.1.0
-      with:
-        aws-region: ${{ env.AWS_REGION }}
-        role-to-assume: ${{ vars.AWS_BACKEND_ROLE_TO_ASSUME }}
-
-    - uses: aws-actions/amazon-ecr-login@v2
-
-    - uses: docker/setup-buildx-action@v3
-
-    - name: Build & Push
-      uses: docker/build-push-action@v6
-      with:
-        context: .
-        file: ./src/workers/NotSoSimpleEcommerce.InvoiceGenerator/Dockerfile
-        push: true
-        tags: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO_PREFIX }}/invoice-generator:${{ needs.detect-changes.outputs.tag }}
-        cache-from: type=gha,scope=invoice-generator
-        cache-to: type=gha,mode=max,scope=invoice-generator
-
-  notificator:
-    name: notificator
-    needs: [detect-changes]
-    if: needs.detect-changes.outputs.notificator == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v5.1.0
-      with:
-        aws-region: ${{ env.AWS_REGION }}
-        role-to-assume: ${{ vars.AWS_BACKEND_ROLE_TO_ASSUME }}
-
-    - uses: aws-actions/amazon-ecr-login@v2
-
-    - uses: docker/setup-buildx-action@v3
-
-    - name: Build & Push
-      uses: docker/build-push-action@v6
-      with:
-        context: .
-        file: ./src/workers/NotSoSimpleEcommerce.Notificator/Dockerfile
-        push: true
-        tags: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO_PREFIX }}/notificator:${{ needs.detect-changes.outputs.tag }}
-        cache-from: type=gha,scope=notificator
-        cache-to: type=gha,mode=max,scope=notificator
+        tags: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO_PREFIX }}/${{ matrix.service }}:${{ needs.detect-changes.outputs.tag }}
+        # Mesmo scope do CI, entao o build aqui reaproveita o cache de la.
+        cache-from: type=gha,scope=${{ matrix.service }}
+        cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
   update-gitops:
     name: update-gitops
-    needs:
-    - detect-changes
-    - main
-    - order
-    - identity-server
-    - health-checker
-    - invoice-generator
-    - notificator
-    # always() porque os jobs de servico nao alterados ficam skipped, e skipped
-    # reprova o needs implicito. Exigimos apenas que nenhum tenha falhado.
+    needs: [detect-changes, build-and-push]
+    # always() porque build-and-push fica skipped quando nada mudou. Exigimos
+    # que nenhum servico tenha falhado, para nao mover a tag pela metade.
     if: >
       always() &&
       needs.detect-changes.result == 'success' &&
-      !contains(needs.*.result, 'failure') &&
-      !contains(needs.*.result, 'cancelled')
+      needs.detect-changes.outputs.services != '[]' &&
+      needs.build-and-push.result == 'success'
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -360,32 +217,19 @@ jobs:
       working-directory: ${{ env.GITOPS_KUSTOMIZE_DIR }}
       env:
         TAG: ${{ needs.detect-changes.outputs.tag }}
-        MAIN: ${{ needs.detect-changes.outputs.main }}
-        ORDER: ${{ needs.detect-changes.outputs.order }}
-        IDENTITY: ${{ needs.detect-changes.outputs.identity_server }}
-        HEALTH: ${{ needs.detect-changes.outputs.health_checker }}
-        INVOICE: ${{ needs.detect-changes.outputs.invoice_generator }}
-        NOTIFICATOR: ${{ needs.detect-changes.outputs.notificator }}
-        DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+        SERVICES: ${{ needs.detect-changes.outputs.services }}
       run: |
         set -euo pipefail
-
         # "*" preserva o newName existente e troca apenas a newTag.
-        bump() {
-          echo "bump $1 -> ${TAG}"
-          kustomize edit set image "${ECR_REGISTRY}/${IMAGE_REPO_PREFIX}/$1=*:${TAG}"
-        }
-
-        if [ "$MAIN" = "true" ]        || [ "$DISPATCH" = "true" ]; then bump main; fi
-        if [ "$ORDER" = "true" ]       || [ "$DISPATCH" = "true" ]; then bump order; fi
-        if [ "$IDENTITY" = "true" ]    || [ "$DISPATCH" = "true" ]; then bump identity-server; fi
-        if [ "$HEALTH" = "true" ]      || [ "$DISPATCH" = "true" ]; then bump health-checker; fi
-        if [ "$INVOICE" = "true" ]     || [ "$DISPATCH" = "true" ]; then bump invoice-generator; fi
-        if [ "$NOTIFICATOR" = "true" ] || [ "$DISPATCH" = "true" ]; then bump notificator; fi
+        for svc in $(jq -r '.[].service' <<<"$SERVICES"); do
+          echo "bump ${svc} -> ${TAG}"
+          kustomize edit set image "${ECR_REGISTRY}/${IMAGE_REPO_PREFIX}/${svc}=*:${TAG}"
+        done
 
     - name: Commit & push
       env:
         TAG: ${{ needs.detect-changes.outputs.tag }}
+        SERVICES: ${{ needs.detect-changes.outputs.services }}
       run: |
         set -euo pipefail
         git config user.email "ci-bot@nsse.dev"
@@ -397,7 +241,8 @@ jobs:
           exit 0
         fi
 
-        git commit -m "ci(cd): bump backend images to ${TAG}"
+        LIST=$(jq -r '[.[].service] | join(", ")' <<<"$SERVICES")
+        git commit -m "ci(cd): bump ${LIST} to ${TAG}"
 
         # Outro deploy pode ter empurrado nesse intervalo.
         for attempt in 1 2 3; do
