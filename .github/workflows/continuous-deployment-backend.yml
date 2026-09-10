@@ -32,6 +32,10 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Consultar a ultima execucao bem-sucedida deste workflow.
+      actions: read
     outputs:
       tag: ${{ steps.refs.outputs.tag }}
       # Array JSON com uma entrada por servico alterado, consumido como matriz
@@ -47,16 +51,42 @@ jobs:
 
     - name: Resolve refs and tag
       id: refs
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
         HEAD_SHA=$(git rev-parse HEAD)
-        # Primeiro commit do repositorio nao tem pai; nesse caso compara com a
-        # arvore vazia, o que marca tudo como alterado.
-        if git rev-parse --verify -q HEAD~1 >/dev/null; then
+
+        # A base e o commit da ultima execucao bem-sucedida deste workflow na
+        # main. Comparar com HEAD~1 enxergaria so o ultimo commit e perderia
+        # tudo que veio antes num push de varios commits - foi o que aconteceu
+        # no push dde0de2..a15642e, onde a alteracao do main passou batida.
+        BASE_SHA=""
+        PREV=$(curl -sf \
+          -H "Authorization: Bearer ${GH_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs?status=success&branch=main&per_page=30" \
+          | jq -r --arg wf "$GITHUB_WORKFLOW" --arg self "$GITHUB_RUN_ID" \
+              '[.workflow_runs[] | select(.name == $wf and (.id|tostring) != $self)]
+               | .[0].head_sha // empty' || true)
+
+        # Precisa existir no clone e ser ancestral de HEAD; um force push ou uma
+        # execucao vinda de outra branch tornaria o diff sem sentido.
+        if [ -n "$PREV" ] \
+           && git cat-file -e "${PREV}^{commit}" 2>/dev/null \
+           && git merge-base --is-ancestor "$PREV" "$HEAD_SHA"; then
+          BASE_SHA="$PREV"
+          echo "base: ultima execucao bem-sucedida (${BASE_SHA})"
+        elif git rev-parse --verify -q HEAD~1 >/dev/null; then
           BASE_SHA=$(git rev-parse HEAD~1)
+          echo "base: sem execucao anterior utilizavel, usando HEAD~1 (${BASE_SHA})"
         else
+          # Primeiro commit do repositorio: compara com a arvore vazia, o que
+          # marca tudo como alterado.
           BASE_SHA=$(git hash-object -t tree /dev/null)
+          echo "base: arvore vazia (repositorio sem commit anterior)"
         fi
+
         echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
         echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
         echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
