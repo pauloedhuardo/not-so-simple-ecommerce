@@ -11,8 +11,8 @@ namespace NotSoSimpleEcommerce.Main.Controllers
         {
             return Ok(new
             {
-                message = "Hello World v2 from Main Service!",
-                version = "v2",
+                message = "Hello World v1 from Main Service!",
+                version = "v1",
                 timestamp = DateTime.UtcNow
             });
         }
